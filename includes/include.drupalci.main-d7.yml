@@ -1,0 +1,276 @@
+####################
+### EXPERIMENTAL ###
+####################
+
+################
+# Snippets that are used elsewhere
+################
+
+.with-database: &with-database
+  name: $_CONFIG_DOCKERHUB_ROOT/$_TARGET_DB_TYPE-$_TARGET_DB_VERSION:production
+  alias: database
+
+.with-chrome: &with-chrome
+  name: $_CONFIG_DOCKERHUB_ROOT/chromedriver:production
+  alias: chrome
+  entrypoint:
+    - chromedriver
+    - "--no-sandbox"
+    - "--log-path=/tmp/chromedriver.log"
+    - "--verbose"
+    - "--whitelisted-ips="
+
+.test-variables:
+  variables:
+    MODULE_NAME: $CI_PROJECT_NAME
+    BROWSERTEST_OUTPUT_DIRECTORY: $CI_PROJECT_DIR/$_WEB_ROOT/sites/simpletest/browser_output
+    FF_NETWORK_PER_BUILD: 1
+    SIMPLETEST_BASE_URL: http://localhost/$_WEB_ROOT
+    DB_DRIVER: mysql
+    MYSQL_ROOT_PASSWORD: root
+    MYSQL_DATABASE: mysql
+    MYSQL_USER: drupaltestbot
+    MYSQL_PASSWORD: drupaltestbotpw
+    MARIADB_TAG: $_TARGET_DB_VERSION
+    POSTGRES_TAG: $_TARGET_DB_VERSION
+    POSTGRES_DB: drupaltestbot
+    POSTGRES_USER: drupaltestbot
+    POSTGRES_PASSWORD: drupaltestbotpw
+    MINK_DRIVER_ARGS_WEBDRIVER: '["chrome", {"browserName":"chrome","chromeOptions":{"args":["--disable-dev-shm-usage","--disable-gpu","--headless"]}}, "http://localhost:9515"]'
+
+.show-environment-variables: &show-environment-variables
+  # Display all environment variables except those that contain personal identifiable information.
+  - |
+    if [ "$_SHOW_ENVIRONMENT_VARIABLES" == "1" ]; then
+      echo -e "\e[0Ksection_start:`date +%s`:show_env_vars[collapsed=true]\r\e[0KShow Environment Variables"
+      env | sort | sed -E '/^(GITLAB_USER).*/d'
+      echo -e "\e[0Ksection_end:`date +%s`:show_env_vars\r\e[0K"
+    fi
+
+.simpletest-db: &simpletest-db
+  - |
+    # Default to SQLite unless another known type is set.
+    export SIMPLETEST_DB=sqlite://localhost/sites/default/files/db.sqlite
+    [[ $_TARGET_DB_TYPE == "mysql" ]] && export SIMPLETEST_DB=mysql://$MYSQL_USER:$MYSQL_PASSWORD@database/$MYSQL_DATABASE
+    [[ $_TARGET_DB_TYPE == "pgsql" ]] && export SIMPLETEST_DB=pgsql://$POSTGRES_USER:$POSTGRES_PASSWORD@database/$POSTGRES_DB
+
+.setup-webserver: &setup-webserver
+  - mkdir -p $BROWSERTEST_OUTPUT_DIRECTORY
+  - chmod -R 755 $BROWSERTEST_OUTPUT_DIRECTORY
+  - ln -s $CI_PROJECT_DIR/$_WEB_ROOT /var/www/html
+  - chown -R www-data:www-data $CI_PROJECT_DIR
+  - service apache2 start
+
+.install-drupal: &install-drupal
+  - |
+    # Install Drupal.
+    sleep 5
+    vendor/bin/drush --root=$_WEB_ROOT si -y --db-url=$SIMPLETEST_DB --clean-url=0 --account-name=admin --account-pass=drupal --account-mail=admin@example.com
+    vendor/bin/drush --root=$_WEB_ROOT vset simpletest_clear_results '0'
+    vendor/bin/drush --root=$_WEB_ROOT vset simpletest_verbose '0'
+    # In case the module had a composer.json file.
+    vendor/bin/drush --root=$_WEB_ROOT vset composer_manager_vendor_dir "$CI_PROJECT_DIR/vendor"
+    vendor/bin/drush --root=$_WEB_ROOT vset composer_manager_file_dir "$CI_PROJECT_DIR"
+    vendor/bin/drush --root=$_WEB_ROOT vset composer_manager_autobuild_packages "0"
+    # Enable modules for testing.
+    vendor/bin/drush --root=$_WEB_ROOT en -y simpletest
+    vendor/bin/drush --root=$_WEB_ROOT cc all
+    vendor/bin/drush --root=$_WEB_ROOT en -y $MODULE_NAME
+    vendor/bin/drush --root=$_WEB_ROOT st
+    # Folder permissions.
+    mkdir -p $_WEB_ROOT/sites/default/files
+    chmod -R 755 $_WEB_ROOT/sites/default/files
+    chown -R www-data:www-data $_WEB_ROOT/sites/default/files
+
+################
+# Set global defaults, including:
+# - interruptible:true, so that new pushes can stop the current job and start a new one
+# - php image
+################
+
+default:
+  interruptible: true
+  image:
+    name: $_CONFIG_DOCKERHUB_ROOT/php-$_TARGET_PHP-apache:production
+  retry:
+    max: 2
+    when:
+      - unknown_failure
+      - api_failure
+      - stuck_or_timeout_failure
+      - runner_system_failure
+      - scheduler_failure
+
+################
+# Stages
+#
+# Each job is assigned to a stage, defining the order in which the jobs are executed.
+# Jobs in the same stage run in parallel.
+#
+################
+
+stages:
+  ################
+  # Build
+  #
+  # In the Build stage we are assembling our test environment:
+  #   * Selecting the core version to test against
+  #   * Selecting php version
+  #   * Selecting the database, and configuring it
+  #   * Plus any additional build steps, like composer runs, etc
+  # Wherever possible, we use variables defined in: include.druaplci.variables.yml so that the configuration can stay up to date with current Drupal Core development.
+  #
+  # Documentation: https://docs.gitlab.com/ee/ci/yaml/#stages
+  ################
+  - build
+
+  ################
+  # Validate
+  #
+  # The validate stage includes any codebase validation.
+  ################
+  - validate
+
+  ################
+  # Test
+  #
+  # The test phase actually executes the functional tests, as well as gathering results and artifacts.
+  ################
+  - test
+
+################
+# Jobs
+#
+# Jobs define what scripts are actually executed in each stage.
+#
+# The 'rules' keyword can also be used to define conditions for each job.
+# # @TODO: Use rules to define core version to test against, allow overriding default on manual run with variables. (Perhaps with 'variables in variables')
+#
+# Documentation: https://docs.gitlab.com/ee/ci/jobs/
+################
+
+################
+# Build Jobs
+################
+
+# A hidden re-usable job. Useful when using a job matrix.
+# For example https://git.drupalcode.org/project/keycdn
+.composer-base:
+  stage: build
+  rules:
+    - if: '$SKIP_COMPOSER == "1"'
+      when: never
+    - when: always
+  variables:
+    COMPOSER_NO_INTERACTION: 1
+  # Use artifacts to copy codebase to subsequent jobs.
+  # See https://lorisleiva.com/laravel-deployment-using-gitlab-pipelines/.
+  artifacts:
+    expire_in: 1 week
+    expose_as: 'web-vendor'
+    when: always
+    exclude:
+      - .git
+      - .git/**/*
+    paths:
+      - .
+  script:
+    - *show-environment-variables
+    # https://www.drupal.org/project/composer/issues/3178950
+    - composer self-update --1
+    # Extract Core into default directory then rename to $_WEB_ROOT
+    - curl https://ftp.drupal.org/files/projects/drupal-$_TARGET_D7_CORE.tar.gz | tar -xz
+    - mv drupal-$_TARGET_D7_CORE $CI_PROJECT_DIR/$_WEB_ROOT
+    - curl -OL https://git.drupalcode.org/$_GITLAB_TEMPLATES_REPO/-/raw/$_GITLAB_TEMPLATES_REF/scripts/symlink_project.php
+    # We need a composer.json file but do not overwrite if it exists.
+    - test -f composer.json || echo "{}" > composer.json
+    - composer config repositories.0 composer https://packages.drupal.org/7
+    # Get dependencies that will be used at a later stage.
+    - composer require --dev drupal/coder:^8.2@stable phpunit/phpunit symfony/filesystem drush/drush:~8 drupal/composer:1.x-dev
+    # Move the command to the vendor folder, otherwise it will try in the native drush.
+    - mv vendor/drupal/composer vendor/drush/drush/commands/composer
+    - php symlink_project.php
+    # Adapt path to D7.
+    - mkdir -p $_WEB_ROOT/sites/all/modules/custom/$MODULE_NAME
+    - cp -LR $CI_PROJECT_DIR/$_WEB_ROOT/modules/custom/$MODULE_NAME/* $_WEB_ROOT/sites/all/modules/custom/$MODULE_NAME/
+    - rm -rf $CI_PROJECT_DIR/$_WEB_ROOT/modules/custom
+
+composer:
+  extends: .composer-base
+
+################
+# Validate Jobs
+################
+
+phpcs:
+  stage: validate
+  needs: ["composer"]
+  rules:
+    - if: '$SKIP_PHPCS == "1"'
+      when: never
+    - when: on_success
+  script:
+    - test -f phpcs.xml.dist || curl -OL https://git.drupalcode.org/$_GITLAB_TEMPLATES_REPO/-/raw/$_GITLAB_TEMPLATES_REF/scripts/phpcs.xml.dist
+    - vendor/bin/phpcs --basepath=$CI_PROJECT_DIR -s $_WEB_ROOT/sites/all/modules/custom --report-junit=junit.xml --report-full --report-summary --report-source
+  allow_failure: true
+  artifacts:
+    expose_as: junit
+    expire_in: 6 mos
+    when: always
+    paths:
+      - junit.xml
+    reports:
+      junit: junit.xml
+
+################
+# Test Jobs
+################
+
+# A hidden re-usable job. Useful when using a job matrix.
+# A matrix example: https://git.drupalcode.org/project/keycdn
+.phpunit-base:
+  stage: test
+  rules:
+    - if: '$SKIP_PHPUNIT == "1"'
+      when: never
+    - when: on_success
+  needs: ["composer"]
+  extends:
+    - .test-variables
+  variables:
+    SYMFONY_DEPRECATIONS_HELPER: weak
+  services:
+    - <<: *with-database
+    - <<: *with-chrome
+  script:
+    - *show-environment-variables
+    - *setup-webserver
+    - *simpletest-db
+    - *install-drupal
+    # Patch core for drupal_web_test_case.php fix
+    # See https://www.drupal.org/project/drupal/issues/3393147
+    # See https://www.drupal.org/project/gitlab_templates/issues/3391902
+    # @todo Remove the patching when Drupal Core 7.99 is used here.
+    - cd $CI_PROJECT_DIR/$_WEB_ROOT
+    - curl https://git.drupalcode.org/project/drupal/-/commit/5fa9cc2ddcc7ca811b1b5afb6f1c091843fe53d5.diff | patch -p1 --verbose
+    - cd $CI_PROJECT_DIR
+    # Execute tests.
+    - sudo SYMFONY_DEPRECATIONS_HELPER="$SYMFONY_DEPRECATIONS_HELPER" MINK_DRIVER_ARGS_WEBDRIVER="$MINK_DRIVER_ARGS_WEBDRIVER" -u www-data php $_WEB_ROOT/scripts/run-tests.sh --color --concurrency "32" --url "$SIMPLETEST_BASE_URL" --verbose --fail-only --xml "$BROWSERTEST_OUTPUT_DIRECTORY" --directory sites/all/modules/custom $_PHPUNIT_EXTRA || EXIT_CODE=$?
+    - cp /var/log/apache2/test.apache.access.log $CI_PROJECT_DIR/apache.access.log.txt
+    - cp /var/log/apache2/test.apache.error.log $CI_PROJECT_DIR/apache.error.log.txt
+    - exit $EXIT_CODE
+  artifacts:
+    expire_in: 6 mos
+    expose_as: 'junit-browser_output-apache_log'
+    when: always
+    reports:
+      junit: junit.xml
+    paths:
+      - junit.xml
+      - apache.access.log.txt
+      - apache.error.log.txt
+      - $BROWSERTEST_OUTPUT_DIRECTORY
+
+phpunit:
+  # An include of the code above, for easy reuse. See https://docs.gitlab.com/ee/ci/yaml/#extends.
+  extends: .phpunit-base

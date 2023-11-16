@@ -1,0 +1,550 @@
+################
+# Snippets that are used elsewhere
+################
+
+.with-database: &with-database
+  name: $_CONFIG_DOCKERHUB_ROOT/$_TARGET_DB_TYPE-$_TARGET_DB_VERSION:production
+  alias: database
+
+.with-chrome: &with-chrome
+  name: $_CONFIG_DOCKERHUB_ROOT/chromedriver:production
+  alias: chrome
+  entrypoint:
+    - chromedriver
+    - "--no-sandbox"
+    - "--log-path=/tmp/chromedriver.log"
+    - "--verbose"
+    - "--whitelisted-ips="
+
+.test-variables:
+  variables:
+    BROWSERTEST_OUTPUT_DIRECTORY: $CI_PROJECT_DIR/$_WEB_ROOT/sites/simpletest/browser_output
+    FF_NETWORK_PER_BUILD: 1
+    SIMPLETEST_BASE_URL: http://localhost/$_WEB_ROOT
+    DB_DRIVER: mysql
+    MYSQL_ROOT_PASSWORD: root
+    MYSQL_DATABASE: mysql
+    MYSQL_USER: drupaltestbot
+    MYSQL_PASSWORD: drupaltestbotpw
+    MARIADB_TAG: $_TARGET_DB_VERSION
+    POSTGRES_TAG: $_TARGET_DB_VERSION
+    POSTGRES_DB: drupaltestbot
+    POSTGRES_USER: drupaltestbot
+    POSTGRES_PASSWORD: drupaltestbotpw
+    MINK_DRIVER_ARGS_WEBDRIVER: '["chrome", {"browserName":"chrome","chromeOptions":{"args":["--disable-dev-shm-usage","--disable-gpu","--headless"]}}, "http://localhost:9515"]'
+
+.show-environment-variables: &show-environment-variables
+  # Display all environment variables except those that contain personal identifiable information.
+  - |
+    if [ "$_SHOW_ENVIRONMENT_VARIABLES" == "1" ]; then
+      echo -e "\e[0Ksection_start:`date +%s`:show_env_vars[collapsed=true]\r\e[0KShow Environment Variables"
+      env | sort | sed -E '/^(GITLAB_USER).*/d'
+      echo -e "\e[0Ksection_end:`date +%s`:show_env_vars\r\e[0K"
+    fi
+
+.simpletest-db: &simpletest-db
+  - |
+    [[ $_TARGET_DB_TYPE == "sqlite" ]] && export SIMPLETEST_DB=sqlite://localhost/sites/default/files/db.sqlite
+    [[ $_TARGET_DB_TYPE == "mysql" ]] && export SIMPLETEST_DB=mysql://$MYSQL_USER:$MYSQL_PASSWORD@database/$MYSQL_DATABASE
+    [[ $_TARGET_DB_TYPE == "pgsql" ]] && export SIMPLETEST_DB=pgsql://$POSTGRES_USER:$POSTGRES_PASSWORD@database/$POSTGRES_DB
+
+.setup-webserver: &setup-webserver
+  - mkdir -p $BROWSERTEST_OUTPUT_DIRECTORY
+  - chmod -R 755 $BROWSERTEST_OUTPUT_DIRECTORY
+  - ln -s $CI_PROJECT_DIR/$_WEB_ROOT /var/www/html
+  - chown -R www-data:www-data $CI_PROJECT_DIR
+  - service apache2 start
+
+################
+# Set global defaults, including:
+# - interruptible:true, so that new pushes can stop the current job and start a new one
+# - php image
+################
+
+default:
+  interruptible: true
+  image:
+    name: $_CONFIG_DOCKERHUB_ROOT/php-$_TARGET_PHP-apache:production
+  retry:
+    max: 2
+    when:
+      - unknown_failure
+      - api_failure
+      - stuck_or_timeout_failure
+      - runner_system_failure
+      - scheduler_failure
+
+################
+# Stages
+#
+# Each job is assigned to a stage, defining the order in which the jobs are executed.
+# Jobs in the same stage run in parallel.
+#
+################
+
+stages:
+  ################
+  # Build
+  #
+  # In the Build stage we are assembling our test environment:
+  #   * Selecting the core version to test against
+  #   * Selecting php version
+  #   * Selecting the database, and configuring it
+  #   * Plus any additional build steps, like composer runs, etc
+  # Wherever possible, we use variables defined in: include.druaplci.variables.yml so that the configuration can stay up to date with current Drupal Core development.
+  #
+  # Documentation: https://docs.gitlab.com/ee/ci/yaml/#stages
+  ################
+  - build
+
+  ################
+  # Validate
+  #
+  # The validate stage includes any codebase validation.
+  ################
+  - validate
+
+  ################
+  # Test
+  #
+  # The test phase actually executes the functional tests, as well as gathering results and artifacts.
+  ################
+  - test
+
+################
+# Jobs
+#
+# Jobs define what scripts are actually executed in each stage.
+#
+# The 'rules' keyword can also be used to define conditions for each job.
+# # @TODO: Use rules to define core version to test against, allow overriding default on manual run with variables. (Perhaps with 'variables in variables')
+#
+# Documentation: https://docs.gitlab.com/ee/ci/jobs/
+################
+
+################
+# Build Jobs
+################
+
+# A hidden re-usable job. Useful when using a job matrix.
+# For example https://git.drupalcode.org/project/keycdn
+.composer-base:
+  stage: build
+  rules:
+    - if: '$SKIP_COMPOSER == "1"'
+      when: never
+    - when: always
+  variables:
+    COMPOSER_NO_INTERACTION: 1
+  # Use artifacts to copy codebase to subsequent jobs.
+  # See https://lorisleiva.com/laravel-deployment-using-gitlab-pipelines/.
+  artifacts:
+    expire_in: 1 week
+    expose_as: 'web-vendor'
+    when: always
+    exclude:
+      - .git
+      - .git/**/*
+    paths:
+      - .
+  script:
+    - *show-environment-variables
+    # Expand the composer.json from the module with defaults to bring the Drupal project.
+    - curl -OL https://git.drupalcode.org/$_GITLAB_TEMPLATES_REPO/-/raw/$_GITLAB_TEMPLATES_REF/scripts/expand_composer_json.php
+    - php expand_composer_json.php
+    - composer install $COMPOSER_EXTRA
+    - rm expand_composer_json.php
+    # Symlink module files to a module folder so we can do a full Drupal install.
+    - curl -OL https://git.drupalcode.org/$_GITLAB_TEMPLATES_REPO/-/raw/$_GITLAB_TEMPLATES_REF/scripts/symlink_project.php
+    - php symlink_project.php
+    # For Nightwatch et al.
+    - yarn --cwd $_WEB_ROOT/core install
+    - touch $_WEB_ROOT/core/.env
+
+composer:
+  extends: .composer-base
+
+composer (max PHP version):
+  extends: .composer-base
+  rules:
+    - if: '$SKIP_PHPUNIT == "1"'
+      when: never
+    - if: '$OPT_IN_TEST_MAX_PHP == "1"'
+  variables:
+    _TARGET_PHP: $CORE_PHP_MAX
+
+composer (previous major):
+  extends: .composer-base
+  rules:
+    - if: '$SKIP_PHPUNIT == "1"'
+      when: never
+    - if: '$OPT_IN_TEST_PREVIOUS_MAJOR == "1"'
+  variables:
+    _TARGET_PHP: $CORE_PREVIOUS_PHP_MIN
+    _TARGET_CORE: $CORE_PREVIOUS_STABLE
+
+composer (previous minor):
+  extends: .composer-base
+  rules:
+    - if: '$SKIP_PHPUNIT == "1"'
+      when: never
+    - if: '$OPT_IN_TEST_PREVIOUS_MINOR == "1"'
+  variables:
+    _TARGET_CORE: $CORE_SECURITY_PREVIOUS_MINOR
+
+composer (next minor):
+  extends: .composer-base
+  rules:
+    - if: '$SKIP_PHPUNIT == "1"'
+      when: never
+    - if: '$OPT_IN_TEST_NEXT_MINOR == "1"'
+  variables:
+    _TARGET_CORE: $CORE_NEXT_MINOR
+
+composer (next major):
+  extends: .composer-base
+  rules:
+    - if: '$SKIP_PHPUNIT == "1"'
+      when: never
+    - if: '$OPT_IN_TEST_NEXT_MAJOR == "1"'
+  variables:
+    _TARGET_PHP: $CORE_PHP_MAX
+    _TARGET_CORE: $CORE_MAJOR_DEVELOPMENT
+
+################
+# Validate Jobs
+################
+
+composer-lint:
+  stage: validate
+  rules:
+    - if: '$SKIP_COMPOSER_LINT == "1"'
+      when: never
+    - when: on_success
+  needs:
+    - composer
+  script:
+    - composer validate
+    - vendor/bin/parallel-lint --no-progress -e php,module,install,inc $_PARALLEL_LINT_EXTRA --exclude $_WEB_ROOT --exclude ./vendor .
+
+phpcs:
+  stage: validate
+  rules:
+    - if: '$SKIP_PHPCS == "1"'
+      when: never
+    - when: on_success
+  needs:
+    - composer
+  script:
+    - test -f phpcs.xml.dist || curl -OL https://git.drupalcode.org/$_GITLAB_TEMPLATES_REPO/-/raw/$_GITLAB_TEMPLATES_REF/scripts/phpcs.xml.dist
+    - vendor/bin/phpcs -s $_WEB_ROOT/modules/custom --report-junit=junit.xml --report-full --report-summary --report-source
+  allow_failure: true
+  artifacts:
+    expose_as: junit
+    expire_in: 6 mos
+    when: always
+    paths:
+      - junit.xml
+    reports:
+      junit: junit.xml
+
+phpstan:
+  extends: .phpstan-base
+
+.phpstan-base:
+  stage: validate
+  rules:
+    - if: '$SKIP_PHPSTAN == "1"'
+      when: never
+    - when: on_success
+  needs:
+    - composer
+  script:
+    # If present, use PHPStan configuration neon file.
+    - |
+      export PHPSTAN_CONFIGURATION=""
+      [[ -f $_WEB_ROOT/modules/custom/$CI_PROJECT_NAME/phpstan.neon ]] && export PHPSTAN_CONFIGURATION="--configuration=$_WEB_ROOT/modules/custom/$CI_PROJECT_NAME/phpstan.neon"
+    # Rely on PHPStan caching to execute analysis multiple times without performance drawback.
+    # Output a copy in junit.
+    - php vendor/bin/phpstan analyze $_WEB_ROOT/modules/custom/$CI_PROJECT_NAME $PHPSTAN_CONFIGURATION --error-format=junit > junit.xml || true
+    # Output a copy in GitLab code quality format.
+    - php vendor/bin/phpstan analyze $_WEB_ROOT/modules/custom/$CI_PROJECT_NAME $PHPSTAN_CONFIGURATION --no-progress --error-format=gitlab > phpstan-quality-report.json || true
+    # Output a copy in plain text for human logs.
+    - php vendor/bin/phpstan analyze $_WEB_ROOT/modules/custom/$CI_PROJECT_NAME $PHPSTAN_CONFIGURATION --no-progress || EXIT_CODE=$?
+    # Generate a new baseline. Allow empty baseline to ensure that artifact exists.
+    - |
+      echo "Generating an PHPStan baseline file (available as job artifact) that can be included in the project. If the project already has one, you might need to manually merge them."
+      php vendor/bin/phpstan analyze $_WEB_ROOT/modules/custom/$CI_PROJECT_NAME $PHPSTAN_CONFIGURATION --no-progress --generate-baseline --allow-empty-baseline || true
+    # Ensure paths in artifacts are git-relative.
+    - sed -i "s#$_WEB_ROOT/modules/custom/$CI_PROJECT_NAME/##" junit.xml phpstan-baseline.neon phpstan-quality-report.json || true
+    - exit $EXIT_CODE
+  allow_failure: true
+  artifacts:
+    expose_as: phpstan
+    when: always
+    expire_in: 6 mos
+    reports:
+      codequality: phpstan-quality-report.json
+      junit: junit.xml
+    paths:
+      - junit.xml
+      - phpstan-baseline.neon
+      - phpstan-quality-report.json
+
+stylelint:
+  stage: validate
+  allow_failure: true
+  rules:
+    - if: '$SKIP_STYLELINT == "1"'
+      when: never
+    - exists:
+        - "**/*.css"
+      when: on_success
+    - when: never
+  needs:
+    - composer
+  script:
+    - yarn --cwd $_WEB_ROOT/core add stylelint-junit-formatter
+    # the `|| true` makes sure both steps run https://stackoverflow.com/questions/59180675/how-to-continue-job-even-when-script-fails
+    - yarn --silent --cwd $_WEB_ROOT/core stylelint --formatter verbose --config ./.stylelintrc.json ../modules/custom/**/*.css --color || true
+    - yarn --silent --cwd $_WEB_ROOT/core stylelint --formatter verbose --config ./.stylelintrc.json ../modules/custom/**/*.css --color --custom-formatter node_modules/stylelint-junit-formatter > junit.xml
+  artifacts:
+    expose_as: junit
+    expire_in: 6 mos
+    when: always
+    paths:
+      - junit.xml
+    reports:
+      junit: junit.xml
+
+eslint:
+  stage: validate
+  rules:
+    - if: '$SKIP_ESLINT == "1"'
+      when: never
+    - exists:
+        - "**/*.js"
+        - "**/*.yml"
+      when: on_success
+    - when: never
+  needs:
+    - composer
+  script:
+    # Change directory to the project root folder
+    - cd $CI_PROJECT_DIR/$_WEB_ROOT/modules/custom/$CI_PROJECT_NAME
+    # Configure prettier
+    - test -e .prettierrc.json || ln -s $CI_PROJECT_DIR/$_WEB_ROOT/core/.prettierrc.json .
+    - test -e .prettierignore || echo '*.yml' > .prettierignore
+    # Run twice in order to show output in console log and also in junit file. https://stackoverflow.com/questions/58391647/eslint-output-to-file-and-console-at-the-same-time
+    # The `|| true` makes sure the second call runs even if the first fails. https://stackoverflow.com/questions/59180675/how-to-continue-job-even-when-script-fails
+    - $CI_PROJECT_DIR/$_WEB_ROOT/core/node_modules/.bin/eslint --no-error-on-unmatched-pattern --ignore-pattern="*.es6.js" --resolve-plugins-relative-to=$CI_PROJECT_DIR/$_WEB_ROOT/core --ext=.js,.yml . || true
+    - $CI_PROJECT_DIR/$_WEB_ROOT/core/node_modules/.bin/eslint --no-error-on-unmatched-pattern --ignore-pattern="*.es6.js" --resolve-plugins-relative-to=$CI_PROJECT_DIR/$_WEB_ROOT/core --ext=.js,.yml --format=junit --output-file=$CI_PROJECT_DIR/junit.xml .
+  allow_failure: true
+  artifacts:
+    expose_as: junit
+    expire_in: 6 mos
+    when: always
+    paths:
+      - junit.xml
+    reports:
+      junit: junit.xml
+
+################
+# Test Jobs
+################
+
+.nightwatch-base:
+  stage: test
+  rules:
+    - if: '$SKIP_NIGHTWATCH == "1"'
+      when: never
+    - exists:
+        - tests/src/Nightwatch/**/*.js
+        - modules/*/tests/src/Nightwatch/**/*.js
+      when: on_success
+    - when: never
+  needs: ["composer"]
+  services:
+    - <<: *with-database
+    - <<: *with-chrome
+  extends:
+    - .test-variables
+  variables:
+    DRUPAL_TEST_BASE_URL: $SIMPLETEST_BASE_URL
+    DRUPAL_TEST_WEBDRIVER_HOSTNAME: localhost
+    DRUPAL_TEST_WEBDRIVER_PORT: "9515"
+    DRUPAL_TEST_WEBDRIVER_CHROME_ARGS: '--disable-dev-shm-usage --disable-gpu --headless'
+    DRUPAL_TEST_CHROMEDRIVER_AUTOSTART: "false"
+    DRUPAL_NIGHTWATCH_SEARCH_DIRECTORY: ../
+    DRUPAL_NIGHTWATCH_IGNORE_DIRECTORIES: node_modules,vendor,.*,sites/*/files,sites/*/private,sites/simpletest
+    DRUPAL_NIGHTWATCH_OUTPUT: reports/nightwatch
+  script:
+    - *setup-webserver
+    - *simpletest-db
+    - export DRUPAL_TEST_DB_URL=$SIMPLETEST_DB
+    - *show-environment-variables
+    # Provide some context on the test run.
+    - vendor/bin/drush status
+    - cd $_WEB_ROOT
+    # @see https://git.drupalcode.org/project/drupal/-/commit/dfa16b8aca8e92be1f00a021c520a645f11f0227
+    - cp ./core/.env.example ./core/.env
+    # dotenv-safe/config does not support environment variables.
+    # @see https://github.com/rolodato/dotenv-safe/issues/126
+    # @todo move this to `variables` when the above is resolved.
+    - echo "DRUPAL_TEST_BASE_URL='http://localhost/$_WEB_ROOT'" >> ./core/.env
+    - echo "DRUPAL_TEST_CHROMEDRIVER_AUTOSTART=false" >> ./core/.env
+    - echo "DRUPAL_TEST_DB_URL='${DRUPAL_TEST_DB_URL}'" >> ./core/.env
+    - echo "DRUPAL_TEST_WEBDRIVER_HOSTNAME='localhost'" >> ./core/.env
+    - echo "DRUPAL_TEST_WEBDRIVER_CHROME_ARGS='--disable-dev-shm-usage --disable-gpu --headless'" >> ./core/.env
+    - echo "DRUPAL_TEST_WEBDRIVER_PORT='9515'" >> ./core/.env
+    - cat ./core/.env
+    - mkdir -p ./sites/simpletest ./sites/default/files /var/www/.cache/yarn /var/www/.yarn ./core/reports
+    - chown -R www-data:www-data ./sites/simpletest ./sites/default/files /var/www/.cache/yarn /var/www/.yarn ./core/reports ./core/.env
+    # @todo Uncomment this line and remove the line after it once https://www.drupal.org/project/drupal/issues/3389763 lands.
+    #- sudo BABEL_DISABLE_CACHE=1 DRUPAL_NIGHTWATCH_SEARCH_DIRECTORY=modules/custom/ -u www-data yarn --cwd ./core test:nightwatch
+    - sudo BABEL_DISABLE_CACHE=1 -u www-data yarn --cwd ./core test:nightwatch --tag=$CI_PROJECT_NAME
+  artifacts:
+    expire_in: 6 mos
+    expose_as: 'reports'
+    when: always
+    reports:
+      junit: $_WEB_ROOT/core/reports/nightwatch/Tests/*.xml
+    paths:
+      - $_WEB_ROOT/core/reports/nightwatch
+
+nightwatch:
+  # An include of the code above, for easy reuse. See https://docs.gitlab.com/ee/ci/yaml/#extends.
+  extends: .nightwatch-base
+
+# A hidden re-usable job. Useful when using a job matrix.
+# A matrix example: https://git.drupalcode.org/project/keycdn
+.phpunit-base:
+  stage: test
+  rules:
+    - if: '$SKIP_PHPUNIT == "1"'
+      when: never
+    - when: on_success
+  needs: ["composer"]
+  extends:
+    - .test-variables
+  variables:
+    SYMFONY_DEPRECATIONS_HELPER: weak
+  services:
+    - <<: *with-database
+    - <<: *with-chrome
+  script:
+    - *show-environment-variables
+    - *setup-webserver
+    - *simpletest-db
+    # Provide some context on the test run.
+    - vendor/bin/drush status
+    # Remove all spaces from _PHPUNIT_TESTGROUPS for reliable checking and to
+    # ensure only one string is passed to bin/phpunit or run-tests.sh
+    - _PHPUNIT_TESTGROUPS=$(echo $_PHPUNIT_TESTGROUPS | sed -e 's/ //g')
+    # Execute tests.
+    - |
+      if [ "$_PHPUNIT_CONCURRENT" == "0" ]; then
+        # if _PHPUNIT_TESTGROUPS is blank then do not add anything because the test group will be handled by the matrix.
+        # if _PHPUNIT_TESTGROUPS is --all then do not add anything because the default is to run all tests in the module.
+        # Otherwise add --group $_PHPUNIT_TESTGROUPS
+        WHAT_TO_RUN=$([[ "$_PHPUNIT_TESTGROUPS" == "" || "$_PHPUNIT_TESTGROUPS" == "--all" ]] && echo "" || echo "--group $_PHPUNIT_TESTGROUPS")
+        echo "_PHPUNIT_CONCURRENT=$_PHPUNIT_CONCURRENT, _PHPUNIT_TESTGROUPS=$_PHPUNIT_TESTGROUPS, WHAT_TO_RUN=$WHAT_TO_RUN"
+        echo "executing: sudo -u www-data -E vendor/bin/phpunit --no-interaction --printer='\Drupal\Tests\Listeners\HtmlOutputPrinter' --bootstrap $PWD/$_WEB_ROOT/core/tests/bootstrap.php $_WEB_ROOT/modules/custom/$CI_PROJECT_NAME --log-junit junit.xml $WHAT_TO_RUN $_PHPUNIT_EXTRA"
+        sudo -u www-data -E vendor/bin/phpunit --no-interaction --printer="\Drupal\Tests\Listeners\HtmlOutputPrinter" --bootstrap $PWD/$_WEB_ROOT/core/tests/bootstrap.php $_WEB_ROOT/modules/custom/$CI_PROJECT_NAME --log-junit junit.xml $WHAT_TO_RUN $_PHPUNIT_EXTRA || EXIT_CODE=$?
+      elif [ "$_PHPUNIT_CONCURRENT" == "1" ]; then
+        # if _PHPUNIT_TESTGROUPS is blank then do not add anything, because the test group will be handled by the matrix.
+        # if _PHPUNIT_TESTGROUPS is --all then add --directory modules/custom/$CI_PROJECT_NAME
+        # Otherwise add $_PHPUNIT_TESTGROUPS (without the --group)
+        WHAT_TO_RUN=$([[ "$_PHPUNIT_TESTGROUPS" == "" ]] && echo "" || ([[ "$_PHPUNIT_TESTGROUPS" == "--all" ]] && echo "--directory modules/custom/$CI_PROJECT_NAME" || echo "$_PHPUNIT_TESTGROUPS"))
+        echo "_PHPUNIT_CONCURRENT=$_PHPUNIT_CONCURRENT, _PHPUNIT_TESTGROUPS=$_PHPUNIT_TESTGROUPS, WHAT_TO_RUN=$WHAT_TO_RUN"
+        echo "executing: sudo SYMFONY_DEPRECATIONS_HELPER='$SYMFONY_DEPRECATIONS_HELPER' MINK_DRIVER_ARGS_WEBDRIVER='$MINK_DRIVER_ARGS_WEBDRIVER' -u www-data php $_WEB_ROOT/core/scripts/run-tests.sh --color --keep-results --concurrency '32' --repeat '1' --sqlite 'sites/default/files/.sqlite' --dburl $SIMPLETEST_DB --url $SIMPLETEST_BASE_URL --verbose --non-html $WHAT_TO_RUN $_PHPUNIT_EXTRA"
+        sudo SYMFONY_DEPRECATIONS_HELPER="$SYMFONY_DEPRECATIONS_HELPER" MINK_DRIVER_ARGS_WEBDRIVER="$MINK_DRIVER_ARGS_WEBDRIVER" -u www-data php $_WEB_ROOT/core/scripts/run-tests.sh --color --keep-results --concurrency "32" --repeat "1" --sqlite "sites/default/files/.sqlite" --dburl $SIMPLETEST_DB --url $SIMPLETEST_BASE_URL --verbose --non-html $WHAT_TO_RUN $_PHPUNIT_EXTRA || EXIT_CODE=$?
+      fi
+    - cp /var/log/apache2/test.apache.access.log $CI_PROJECT_DIR/apache.access.log.txt
+    - cp /var/log/apache2/test.apache.error.log $CI_PROJECT_DIR/apache.error.log.txt
+    - exit $EXIT_CODE
+  artifacts:
+    expire_in: 6 mos
+    expose_as: 'junit-browser_output-apache_log'
+    when: always
+    reports:
+      junit: junit.xml
+    paths:
+      - junit.xml
+      - apache.access.log.txt
+      - apache.error.log.txt
+      - $BROWSERTEST_OUTPUT_DIRECTORY
+
+phpunit:
+  # An include of the code above, for easy reuse. See https://docs.gitlab.com/ee/ci/yaml/#extends.
+  extends: .phpunit-base
+
+phpunit (max PHP version):
+  extends: phpunit
+  rules:
+    - if: '$SKIP_PHPUNIT == "1"'
+      when: never
+    - if: '$OPT_IN_TEST_MAX_PHP == "1"'
+  needs:
+    - "composer (max PHP version)"
+  variables:
+    _TARGET_PHP: $CORE_PHP_MAX
+
+phpunit (previous major):
+  extends: phpunit
+  rules:
+    - if: '$SKIP_PHPUNIT == "1"'
+      when: never
+    - if: '$OPT_IN_TEST_PREVIOUS_MAJOR == "1"'
+  needs:
+    - "composer (previous major)"
+  variables:
+    _TARGET_PHP: $CORE_PREVIOUS_PHP_MIN
+
+phpunit (previous minor):
+  extends: phpunit
+  rules:
+    - if: '$SKIP_PHPUNIT == "1"'
+      when: never
+    - if: '$OPT_IN_TEST_PREVIOUS_MINOR == "1"'
+  needs:
+    - "composer (previous minor)"
+
+# Future versions, hence breaks may arrive at any time: failure is allowed.
+phpunit (next minor):
+  allow_failure: true
+  extends: phpunit
+  rules:
+    - if: '$SKIP_PHPUNIT == "1"'
+      when: never
+    - if: '$OPT_IN_TEST_NEXT_MINOR == "1"'
+  needs:
+    - "composer (next minor)"
+phpunit (next major):
+  allow_failure: true
+  extends: phpunit
+  rules:
+    - if: '$SKIP_PHPUNIT == "1"'
+      when: never
+    - if: '$OPT_IN_TEST_NEXT_MAJOR == "1"'
+  needs:
+    - "composer (next major)"
+  before_script:
+    # If the module already supports Drupal 11, do nothing, otherwise, claim Drupal 11 support for testing purposes.
+    - grep -q "\^11" *.info.yml || (grep -q "\^10" *.info.yml && sed -i "s/\^10/\^10 \|\| ^11/" *.info.yml)
+  variables:
+    _TARGET_PHP: $CORE_PHP_MAX
+
+
+###############################
+# BACKWARDS COMPATIBILITY LAYER
+###############################
+
+# Cater for referenced name changes from _ to -
+# See https://www.drupal.org/project/gitlab_templates/issues/3390764
+.setup_webserver:
+  - printf "**********\n* Out of date reference .setup_webserver is used.\n* To remove this warning, change it to .setup-webserver\n**********\n"
+  - *setup-webserver
+.simpletest_db:
+  - printf "**********\n* Out of date reference .simpletest_db is used.\n* To remove this warning, replace it with .simpletest-db\n**********\n"
+  - *simpletest-db
